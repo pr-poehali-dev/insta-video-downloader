@@ -1,7 +1,14 @@
 import json
 import re
-import urllib.request
-import urllib.error
+import instaloader
+
+
+CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Content-Type': 'application/json',
+}
 
 
 def _extract_shortcode(url: str):
@@ -9,53 +16,27 @@ def _extract_shortcode(url: str):
     return m.group(1) if m else None
 
 
-def _fetch_via_graphql(shortcode: str):
-    api_url = f'https://www.instagram.com/api/v1/media/{shortcode}/info/'
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-        'X-IG-App-ID': '936619743392459',
-        'Accept': '*/*',
+def _get_video_info(shortcode: str) -> dict:
+    L = instaloader.Instaloader()
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    if not post.is_video:
+        raise ValueError('Этот пост не содержит видео')
+    return {
+        'video_url': post.video_url,
+        'thumbnail': post.url,
     }
-    embed_url = f'https://www.instagram.com/p/{shortcode}/embed/captioned/'
-    req = urllib.request.Request(embed_url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-    })
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        html = resp.read().decode('utf-8', errors='ignore')
-
-    candidates = re.findall(r'"video_url":"([^"]+)"', html)
-    if not candidates:
-        candidates = re.findall(r'<meta property="og:video" content="([^"]+)"', html)
-    if not candidates:
-        candidates = re.findall(r'property="og:video:secure_url" content="([^"]+)"', html)
-
-    if candidates:
-        video_url = candidates[0].encode().decode('unicode_escape').replace('\\/', '/')
-        thumb = re.findall(r'"display_url":"([^"]+)"', html)
-        thumb_url = thumb[0].encode().decode('unicode_escape').replace('\\/', '/') if thumb else None
-        return {'video_url': video_url, 'thumbnail': thumb_url}
-    return None
 
 
 def handler(event: dict, context) -> dict:
-    '''
-    Извлекает прямую ссылку на видео из Instagram по ссылке на пост или Reels.
-    Args: event с httpMethod, body (JSON со ссылкой url)
-    Returns: HTTP-ответ с прямой ссылкой на видео для скачивания
-    '''
-    method = event.get('httpMethod', 'GET')
-    cors = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Content-Type': 'application/json',
-    }
+    """
+    Извлекает прямую ссылку на видео из Instagram через instaloader.
+    POST body: {"url": "https://instagram.com/reel/..."}
+    """
+    if event.get('httpMethod') == 'OPTIONS':
+        return {'statusCode': 200, 'headers': CORS, 'body': ''}
 
-    if method == 'OPTIONS':
-        return {'statusCode': 200, 'headers': cors, 'body': ''}
-
-    if method != 'POST':
-        return {'statusCode': 405, 'headers': cors, 'body': json.dumps({'error': 'Method not allowed'})}
+    if event.get('httpMethod') != 'POST':
+        return {'statusCode': 405, 'headers': CORS, 'body': json.dumps({'error': 'Method not allowed'})}
 
     try:
         body = json.loads(event.get('body') or '{}')
@@ -64,32 +45,28 @@ def handler(event: dict, context) -> dict:
 
     url = (body.get('url') or '').strip()
     if not url:
-        return {'statusCode': 400, 'headers': cors, 'body': json.dumps({'error': 'Укажите ссылку на видео'})}
+        return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Укажите ссылку на видео'})}
 
     shortcode = _extract_shortcode(url)
     if not shortcode:
-        return {'statusCode': 400, 'headers': cors, 'body': json.dumps({'error': 'Это не похоже на ссылку Instagram'})}
+        return {'statusCode': 400, 'headers': CORS, 'body': json.dumps({'error': 'Это не похоже на ссылку Instagram'})}
 
     try:
-        result = _fetch_via_graphql(shortcode)
-    except urllib.error.URLError:
-        result = None
+        info = _get_video_info(shortcode)
+    except instaloader.exceptions.LoginRequiredException:
+        return {'statusCode': 403, 'headers': CORS, 'body': json.dumps({'error': 'Пост приватный или требует авторизации'})}
+    except instaloader.exceptions.InstaloaderException as e:
+        return {'statusCode': 422, 'headers': CORS, 'body': json.dumps({'error': f'Не удалось получить видео: {str(e)}'})}
+    except ValueError as e:
+        return {'statusCode': 422, 'headers': CORS, 'body': json.dumps({'error': str(e)})}
     except Exception:
-        result = None
-
-    if not result or not result.get('video_url'):
-        return {
-            'statusCode': 422,
-            'headers': cors,
-            'body': json.dumps({'error': 'Не удалось получить видео. Возможно, пост приватный или Instagram временно заблокировал доступ.'}),
-        }
+        return {'statusCode': 500, 'headers': CORS, 'body': json.dumps({'error': 'Ошибка сервера, попробуйте позже'})}
 
     return {
         'statusCode': 200,
-        'headers': cors,
+        'headers': CORS,
         'body': json.dumps({
-            'video_url': result['video_url'],
-            'thumbnail': result.get('thumbnail'),
-            'shortcode': shortcode,
+            'video_url': info['video_url'],
+            'thumbnail': info.get('thumbnail'),
         }),
     }
